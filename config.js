@@ -7,7 +7,7 @@ export const CONFIG = {
     // --- General Settings ---
     LOG_LEVEL: 'INFO', // DEBUG, INFO, WARN, ERROR
     HOME_RESERVE_RAM: 32, // GB RAM to keep free on 'home'
-    SCAN_INTERVAL: 60 * 1000, // ms between network scans (1 minute)
+    SCAN_INTERVAL: 15000, // ms between network scans (15 seconds)
 
     // --- Hacking Settings ---
     HACK_TARGET_COUNT: 1, // Number of targets to hack simultaneously (initially 1)
@@ -60,9 +60,9 @@ export const FACTION_CONFIG = {
     ],
     // Work types preference order (will try first available)
     PREFERRED_WORK_TYPES: [
-        ns.enums.FactionWorkType.hacking, // Generally best for rep
-        ns.enums.FactionWorkType.field, 
-        ns.enums.FactionWorkType.security,
+        "hacking", // Generally best for rep
+        "field",
+        "security",
     ],
     FOCUS_ON_WORK: true, // Whether to focus work for faster rep gain
 };

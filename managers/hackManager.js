@@ -13,201 +13,224 @@ export class HackManager {
         this.ns = ns;
         this.log = createLogger(ns, 'HackMan');
         this.resourceManager = resourceManager; // Reference to the resource manager
-        this.activeTarget = null; // Store the target we are actively batching
-        this.targetBatches = new Map(); // Key: target, Value: { config, lastLaunchTime, count }
-        this.batchCounter = 0;
-        this.isSeeding = false; // Flag to manage initial seeding phase
-        this.lastTargetCheckCycle = 0; // Track scheduler cycles for periodic check
-        this.targetCheckInterval = 10; // Re-evaluate best target every 10 cycles
-        this.prepQueue = new Set(); // Targets currently being prepped
+        // this.activeTarget = null; // No longer the single source of truth, but might be used for prioritization later
+        this.targetBatches = new Map(); // Key: target, Value: { config, lastLaunchTime, count, depth, ramLimit, timeLimit, isFullySeeded }
+        this.batchCounter = 0; // Might need adjustment for multi-target
+        // this.isSeeding = false; // Seeding needs rethinking for multiple targets
+        this.prepQueue = new Map(); // Key: target, Value: { state ('start', 'prepping', 'failed'), pid, attempts, prepId, host }
 
         this.ramCosts = {
             hack: ns.getScriptRam(CONFIG.HACK_WORKER),
             grow: ns.getScriptRam(CONFIG.GROW_WORKER),
             weak: ns.getScriptRam(CONFIG.WEAKEN_WORKER),
+            prep: ns.getScriptRam(CONFIG.PREP_WORKER), // Add prep worker RAM cost
         };
 
-        if (this.ramCosts.hack === 0 || this.ramCosts.grow === 0 || this.ramCosts.weak === 0) {
-            this.log.error('One or more worker scripts have 0 RAM cost or are missing! Check config.js paths.');
-            // Consider throwing an error or having a failed state
+        if (this.ramCosts.hack === 0 || this.ramCosts.grow === 0 || this.ramCosts.weak === 0 || this.ramCosts.prep === 0) {
+            this.log.error('One or more worker scripts (including prep) have 0 RAM cost or are missing! Check config.js paths.');
         }
-        this.log.info(`Worker RAM costs: H=${formatRam(ns, this.ramCosts.hack)}, G=${formatRam(ns, this.ramCosts.grow)}, W=${formatRam(ns, this.ramCosts.weak)}`);
+        this.log.info(`Worker RAM costs: H=${formatRam(ns, this.ramCosts.hack)}, G=${formatRam(ns, this.ramCosts.grow)}, W=${formatRam(ns, this.ramCosts.weak)}, P=${formatRam(ns, this.ramCosts.prep)}`);
     }
 
     // --- Core Management Loop --- Called by Scheduler
     async manageHacking(cycle = 0) { // Accept current scheduler cycle number
-        this.log.info('Starting hacking management cycle...');
+        this.log.info(`Starting hacking management cycle ${cycle}...`);
 
-        // Prevent overlapping seeding attempts
-        if (this.isSeeding) {
-            this.log.info('Currently seeding batches for a target. Skipping cycle.');
+        // --- Target Evaluation ---
+        const potentialTargets = this.selectTarget();
+        if (potentialTargets.length === 0) {
+            this.log.info('No viable targets found this cycle.');
             return;
         }
 
-        // --- Target Evaluation & Selection ---
-        let forceRetarget = false;
-        if (this.activeTarget) {
-            const batchState = this.targetBatches.get(this.activeTarget);
-            // Check if drained (only if config exists)
-            if (batchState?.config) {
-                 const money = this.ns.getServerMoneyAvailable(this.activeTarget);
-                 const neededToHack = batchState.config.hackAmount; // Need to add hackAmount to config
-                 if (money < neededToHack) {
-                     this.log.info(`Target ${this.activeTarget} drained below hack amount ($${formatNumber(this.ns, money)} < $${formatNumber(this.ns, neededToHack)}). Forcing retarget.`);
-                     forceRetarget = true;
-                 }
-            }
-            // Periodic re-evaluation
-            if (!forceRetarget && (cycle - this.lastTargetCheckCycle >= this.targetCheckInterval)) {
-                this.log.info('Periodic target re-evaluation...');
-                const bestPossibleTarget = this.selectTarget();
-                 if (bestPossibleTarget && bestPossibleTarget !== this.activeTarget) {
-                    // TODO: Add smarter comparison logic (e.g., is new target significantly better?)
-                    this.log.info(`Found potentially better target ${bestPossibleTarget}. Current: ${this.activeTarget}. Forcing retarget.`);
-                     forceRetarget = true;
-                 } 
-                 this.lastTargetCheckCycle = cycle;
+        // --- Manage Prep Queue First ---
+        const completedPreps = [];
+        const failedPreps = [];
+        for (const [target, prepState] of this.prepQueue.entries()) {
+            this.managePrepCycle(target); // Manage ongoing preps
+            // Check if managePrepCycle removed it (completed) or marked as failed
+            if (!this.prepQueue.has(target)) {
+                completedPreps.push(target);
+            } else if (prepState.state === 'failed') {
+                failedPreps.push(target);
+                this.prepQueue.delete(target); // Remove from queue after logging failure
             }
         }
-
-        if (!this.activeTarget || forceRetarget) {
-             const target = this.selectTarget();
-             if (!target) {
-                 this.log.warn('No suitable target found.');
-                 this.activeTarget = null; // Ensure it stays null
-                 this.targetBatches.clear();
-                 return; 
-             }
-             if (target !== this.activeTarget) {
-                 this.log.info(`Switching active target from ${this.activeTarget} to ${target}`);
-                 this.activeTarget = target;
-                 this.targetBatches.clear(); // Clear old batch state when switching targets
-                 this.lastTargetCheckCycle = cycle; // Reset check timer on new target
-             }
+        if (completedPreps.length > 0) {
+            this.log.info(`Prep finished for: ${completedPreps.join(', ')}`);
+        }
+        if (failedPreps.length > 0) {
+            this.log.error(`Prep failed for: ${failedPreps.join(', ')}. Removed from queue.`);
         }
 
-        const target = this.activeTarget;
-        if (!target) { 
-            this.log.info('No active target this cycle.');
-            return; 
-        } // Exit if target selection failed entirely
+        // --- Process Potential Targets ---
+        this.log.info(`Processing ${potentialTargets.length} potential targets...`);
+        // Get total FREE ram, not the whole stats object
+        const totalFreeRam = this.resourceManager.getNetworkRamStats().totalFreeRam;
+        this.log.info(`Initial free network RAM: ${formatRam(this.ns, totalFreeRam)}`)
+        const ramUsedThisCycle = 0; // Track RAM used in this cycle
 
-        // 2. Prep Target if Necessary / Check Prep Queue
-        if (this.prepQueue.has(target)) {
-            this.log.info(`Target ${target} is still in the prep queue. Skipping batching.`);
-            return; // Don't batch while prepping
-        }
-        if (!this.isTargetPrepped(target)) {
-            this.log.warn(`Target ${target} needs prepping. Adding to prep queue.`);
-            if (!this.prepQueue.has(target)) { // Add only if not already prepping
-                this.targetBatches.delete(target); // Stop batching
-                this.prepQueue.add(target); // Add to prep queue
-                // Run prep asynchronously, don't await it here
-                this.prepTarget(target).catch(e => this.log.error(`Prep task failed for ${target}: ${e}`)); 
+        for (const target of potentialTargets) {
+            // 1. Skip if already being prepped or failed recently
+            if (this.prepQueue.has(target)) {
+                this.log.debug(`Target ${target} is already in the prep queue (State: ${this.prepQueue.get(target).state}). Skipping.`);
+                continue;
             }
-            return;
-        }
+             // Optional: Add logic here to skip targets that failed prep recently
 
-        // 3. Get or Calculate Batch Configuration & Initiate Seeding
-        let batchState = this.targetBatches.get(target);
-        if (!batchState) {
-            const config = this.calculateBatchConfig(target);
-            if (!config) return;
-
-            const { totalFreeRam } = this.resourceManager.getNetworkRamStats();
-            const maxDepthRam = Math.max(1, Math.floor(totalFreeRam / config.ramPerBatch));
-            const depthTime = Math.max(1, Math.floor(config.weakenTime / config.interval));
-            const depth = Math.max(1, Math.min(maxDepthRam, depthTime));
-
-            batchState = {
-                config: config,
-                depth: depth,
-                lastLaunchTime: 0, 
-                count: 0,
-                ramLimit: maxDepthRam,
-                timeLimit: depthTime,
-                isFullySeeded: false // New flag
-            };
-            this.targetBatches.set(target, batchState);
-            this.log.info(`Calculated config for ${target}: Depth=${depth} (RAM=${maxDepthRam}, Time=${depthTime}), Interval=${config.interval}ms`);
-            
-            // --- Initiate Seeding Phase --- 
-            this.isSeeding = true;
-            this.log.info(`--- Starting seed phase for ${target} (Depth: ${depth}) ---`);
-            try {
-                for (let i = 0; i < depth; i++) {
-                    this.log.info(`Seeding batch ${i + 1}/${depth}...`);
-                    const executed = this.executeBatch(config);
-                    if (executed) {
-                        batchState.lastLaunchTime = Date.now(); // Update time for each seed launch
-                        batchState.count++;
-                        if (i < depth - 1) { // Sleep between seed launches, but not after the last one
-                           this.log.debug(`Seed: Sleeping for ${config.interval}ms...`);
-                           await this.ns.sleep(config.interval);
-                        }
-                    } else {
-                        this.log.error(`Seed phase failed on batch ${i + 1}/${depth}. Aborting seed.`);
-                        // Clear state? Mark target as failed? For now, just stop seeding.
-                        this.targetBatches.delete(target);
-                        this.activeTarget = null; // Force target re-selection next cycle
-                        this.isSeeding = false;
-                        return; // Exit cycle
-                    }
+            // 2. Check if prepping is needed
+            if (!this.isTargetPrepped(target)) {
+                this.log.info(`Target ${target} needs prepping.`);
+                const prepRamNeeded = this.calculatePrepRam(target); // Now returns cost of prepWorker
+                if (prepRamNeeded === null || prepRamNeeded === 0) { // null if worker missing, 0 if already prepped
+                    this.log.warn(`Prep worker RAM cost is zero or null for ${target}. Skipping.`);
+                    continue;
                 }
-                batchState.isFullySeeded = true;
-                this.log.info(`--- Seed phase complete for ${target} (${batchState.count} batches launched) ---`);
-            } catch (e) {
-                this.log.error(`Exception during seeding: ${e}`);
-            } finally {
-                 this.isSeeding = false; // Ensure flag is reset even on error
-            }
-             // After seeding, continue to regular scheduling logic in the *next* cycle
-             return; 
-        }
+                this.log.debug(`RAM for prep worker on ${target}: ${formatRam(this.ns, prepRamNeeded)}`);
 
-        // 4. Regular Batch Scheduling (only if fully seeded)
-        if (batchState.isFullySeeded) {
-            const { config, lastLaunchTime } = batchState;
-            const now = Date.now();
-            if (now >= lastLaunchTime + config.interval) {
-                this.log.info(`Interval elapsed for ${target}. Launching maintenance batch #${batchState.count + 1}`);
-                const executed = this.executeBatch(config);
-                if (executed) {
-                    batchState.lastLaunchTime = now; 
-                    batchState.count++;
-                    this.log.info(`Launched maintenance batch ${batchState.count} for ${target}`);
+                // Conceptual check if RAM *might* be available
+                if (totalFreeRam >= ramUsedThisCycle + prepRamNeeded) { 
+                     this.log.info(`Sufficient potential RAM available. Attempting to launch prep worker for ${target}.`);
+                     // Add to queue *before* trying to launch. managePrepCycle will handle launch.
+                     this.prepQueue.set(target, {
+                         state: 'start', // Initial state: needs launching
+                         pid: 0,
+                         attempts: 0,
+                         prepId: `prep-${target}-${Date.now()}`,
+                         host: null // Host will be set by managePrepCycle
+                     });
+                     this.log.info(`[${this.prepQueue.get(target).prepId}] Added ${target} to prep queue. Running managePrepCycle...`);
+                     this.managePrepCycle(target); // Attempt to launch immediately
+                     // If managePrepCycle fails to launch, it will handle state/attempts
                 } else {
-                    this.log.warn(`Failed to execute maintenance batch for ${target}. Will retry next cycle.`);
+                    this.log.info(`Insufficient potential RAM to start prepping ${target} (Needs ${formatRam(this.ns, prepRamNeeded)}, Available ${formatRam(this.ns, totalFreeRam - ramUsedThisCycle)}).`);
+                    break; // Stop trying to schedule more preps if RAM is low
+                }
+                continue; // Move to next target
+            }
+
+            // 3. Target is Prepped - Manage Hacking Batches (with Seeding)
+            this.log.debug(`Target ${target} is prepped. Managing hack batches.`);
+            let batchState = this.targetBatches.get(target);
+            const now = Date.now();
+
+            // Calculate config and initial seeding parameters if it's a new target
+            if (!batchState) {
+                const config = this.calculateBatchConfig(target);
+                if (!config) {
+                    this.log.warn(`Failed to calculate batch config for prepped target ${target}. Skipping.`);
+                    continue;
+                }
+                
+                // Calculate depth based on weaken time and interval
+                // Limited by RAM available at calculation time (might need recalculation?)
+                const { totalFreeRam } = this.resourceManager.getNetworkRamStats();
+                const maxDepthRam = Math.max(1, Math.floor(totalFreeRam / config.ramPerBatch));
+                const maxDepthTime = Math.max(1, Math.floor(config.weakenTime / config.interval)); // Batches fitting in weaken time
+                const depth = Math.min(maxDepthRam, maxDepthTime);
+                this.log.info(`Calculated initial depth for ${target}: ${depth} (RAM Limit: ${maxDepthRam}, Time Limit: ${maxDepthTime})`);
+
+                batchState = {
+                    config: config,
+                    lastLaunchTime: 0, // Time the last batch component was launched
+                    count: 0,          // Total batches launched (including seeds)
+                    isSeeding: true,   // Start in seeding phase
+                    batchesSeeded: 0,  // How many seed batches have launched
+                    depth: depth,      // Target number of overlapping batches
+                    ramLimit: maxDepthRam, // Store limits for potential future adjustments
+                    timeLimit: maxDepthTime,
+                };
+                this.targetBatches.set(target, batchState);
+                this.log.info(`Initialized batch state for ${target}. Starting seed phase (depth ${depth}).`);
+                // Set lastLaunchTime to allow immediate launch of first seed batch
+                batchState.lastLaunchTime = now - config.interval; 
+            }
+
+            const { config, lastLaunchTime, isSeeding, batchesSeeded, depth } = batchState;
+            const interval = config.interval; // Interval between batch launches
+
+            // Check if it's time to launch the next batch (seed or maintenance)
+            if (now >= lastLaunchTime + interval - 50) { // Allow small buffer
+                let batchType = isSeeding ? 'Seed' : 'Maintenance';
+                let currentBatchNumber = isSeeding ? batchesSeeded + 1 : batchState.count + 1;
+
+                if (isSeeding && batchesSeeded >= depth) {
+                    this.log.info(`Seeding complete for ${target} (${batchesSeeded}/${depth} batches). Switching to maintenance.`);
+                    batchState.isSeeding = false;
+                    batchType = 'Maintenance'; // Launch maintenance immediately if interval allows
+                    currentBatchNumber = batchState.count + 1; 
+                }
+
+                this.log.info(`Attempting ${batchType} Batch #${currentBatchNumber}` + (isSeeding ? `/${depth}` : ``) + ` launch for ${target}.`);
+                
+                // Execute batch (checks/reserves RAM internally)
+                const executed = this.executeBatch(config, totalFreeRam - ramUsedThisCycle);
+                
+                if (executed) {
+                    batchState.lastLaunchTime = now;
+                    batchState.count++;
+                    this.log.info(`Successfully initiated ${batchType} Batch ${batchState.count} for ${target}.`); 
+                    if (batchState.isSeeding) { // Check isSeeding again in case it changed
+                        batchState.batchesSeeded++;
+                         this.log.info(`Seed progress for ${target}: ${batchState.batchesSeeded}/${depth}`);
+                         if (batchState.batchesSeeded >= depth) {
+                             batchState.isSeeding = false; // Mark seeding complete
+                              this.log.info(`Seeding fully complete for ${target} after launching batch ${batchState.batchesSeeded}.`);
+                         }
+                    }
+                    // NOTE: We assume ResourceManager handles RAM implicitly.
+                    // If we wanted to launch multiple batches per cycle (e.g., catch up seeding),
+                    // we'd need to update ramUsedThisCycle here and loop/recheck time/RAM.
+                    // For now, only one launch attempt per target per cycle.
+                } else {
+                    this.log.warn(`Failed to execute ${batchType} batch for ${target} (Insufficient RAM or ns.exec failed).`);
+                    // If a seed batch fails, should we pause seeding? Or just retry next cycle?
+                    // If maintenance fails, we just retry next cycle.
+                    // For now, just log and break the outer loop to preserve RAM for higher priority targets.
+                    break; // Stop trying subsequent targets if a batch fails
                 }
             } else {
-                 this.log.debug(`Skipping maintenance batch launch for ${target}. Time until next: ${((lastLaunchTime + config.interval) - now).toFixed(0)}ms`);
+                 this.log.debug(`Skipping batch launch for ${target}. Time until next: ${((lastLaunchTime + interval) - now).toFixed(0)}ms`);
             }
-        } else {
-            // Should not happen if seeding logic is correct, but log just in case
-            this.log.warn(`Target ${target} has state but is not fully seeded. Waiting for seeding to complete.`);
-        }
+        } // End target loop
 
-        this.log.info('Hacking management cycle complete.');
+        this.log.info(`Hacking management cycle ${cycle} complete.`); // Removed RAM log as it's not tracked here directly anymore
     }
 
     // --- Target Selection Logic ---
     selectTarget() {
         const myLevel = this.ns.getHackingLevel();
         const potentialTargets = this.resourceManager.getServers()
-            .filter(s => s.hasRoot && 
-                         this.ns.getServerMaxMoney(s.hostname) >= CONFIG.HACK_MIN_TARGET_MONEY && 
-                         this.ns.getServerRequiredHackingLevel(s.hostname) <= myLevel)
-            .map(s => s.hostname);
+            .filter(s => {
+                if (!s.hasRoot) return false;
+                if (this.ns.getServerMaxMoney(s.hostname) < CONFIG.HACK_MIN_TARGET_MONEY) return false;
+                if (this.ns.getServerRequiredHackingLevel(s.hostname) > myLevel) return false;
+                return true;
+            })
+            .map(s => {
+                const hostname = s.hostname;
+                const maxMoney = this.ns.getServerMaxMoney(hostname);
+                // Use weaken time as a proxy for difficulty/time investment
+                const weakenTime = this.ns.getWeakenTime(hostname);
+                // Avoid division by zero or excessive scores for near-instant weakens
+                const score = maxMoney / Math.max(1, weakenTime); // Use 1ms minimum for calculation
+                return { hostname, score };
+            });
 
         if (potentialTargets.length === 0) {
             this.log.warn('No viable targets found (rooted, min money, hack level).');
-            return null;
+            return []; // Return empty array if none found
         }
 
-        // Simple sort: Max Money
-        // TODO: Add more sophisticated scoring (hack time, growth rate, security level)
-        potentialTargets.sort((a, b) => this.ns.getServerMaxMoney(b) - this.ns.getServerMaxMoney(a));
-        return potentialTargets[0]; // Return the best single target for now
+        // Sort by calculated score (higher is better)
+        potentialTargets.sort((a, b) => b.score - a.score);
+        
+        // Log the top few targets and scores
+        const topTargetsLog = potentialTargets.slice(0, 5).map(t => `${t.hostname} (${formatNumber(this.ns, t.score, 1)})`).join(', ');
+        this.log.info(`Found ${potentialTargets.length} potential targets. Top scores: ${topTargetsLog}`);
+
+        // Return the sorted list of hostnames only
+        return potentialTargets.map(t => t.hostname);
     }
 
     // --- Target Prepping ---
@@ -219,90 +242,99 @@ export class HackManager {
         return sec <= minSec + CONFIG.HACK_PREP_SEC_BUFFER && money >= maxMoney * 0.99; // Allow tiny buffer
     }
 
-    // --- Target Prepping ---
-    async prepTarget(target) {
-        const prepId = `prep-${target}-${Date.now()}`;
-        this.log.info(`[${prepId}] Starting async prep for ${target}`);
-        const spacer = getConfig(this.ns, 'HACK_DEFAULT_SPACER');
-        const prepSecBuffer = getConfig(this.ns, 'HACK_PREP_SEC_BUFFER');
-        try {
-            let attempts = 0;
-            const maxAttempts = 10; // Prevent infinite loops
-            while (attempts < maxAttempts) {
-                attempts++;
-                const currentSec = this.ns.getServerSecurityLevel(target);
-                const minSec = this.ns.getServerMinSecurityLevel(target);
-                const currentMoney = this.ns.getServerMoneyAvailable(target);
-                const maxMoney = this.ns.getServerMaxMoney(target);
-                const secThreshold = minSec + prepSecBuffer;
+    // --- Target Prepping State Machine (Simplified for Prep Worker) ---
+    managePrepCycle(target) {
+        const prepState = this.prepQueue.get(target);
+        if (!prepState) {
+            // This might happen if it finished or failed between the loop start and here
+            this.log.debug(`managePrepCycle called for ${target}, but it's no longer in the prepQueue.`);
+            return;
+        }
 
-                this.log.info(`[${prepId}] Prep Attempt ${attempts}: Sec=${currentSec.toFixed(2)}/${secThreshold.toFixed(2)}, Money=$${formatNumber(this.ns, currentMoney)}/$${formatNumber(this.ns, maxMoney)}`);
+        const { prepId } = prepState;
+        const maxAttempts = 5; // Max attempts to *launch* the worker
 
-                // Step 1: Weaken if necessary
-                if (currentSec > secThreshold) {
-                    const weakenNeeded = currentSec - minSec; // Weaken down to absolute minimum
-                    const threads = Math.max(1, Math.ceil(this.ns.weakenAnalyze(weakenNeeded)));
-                    const weakenTime = this.ns.getWeakenTime(target);
-                    this.log.info(`[${prepId}] Weaken needed (${weakenNeeded.toFixed(2)}). Launching ${threads} threads (ETA: ${(weakenTime / 1000).toFixed(1)}s)...`);
-                    const success = this.executePrepTask(CONFIG.WEAKEN_WORKER, target, threads, prepId);
-                    if (!success) throw new Error(`[${prepId}] Failed launch weaken`);
-                    this.log.info(`[${prepId}] Waiting for weaken...`);
-                    await this.ns.sleep(weakenTime + spacer * 2); 
-                    continue; 
-                }
+        // State: start - Try to launch the prep worker
+        if (prepState.state === 'start') {
+             prepState.attempts++;
+             if (prepState.attempts > maxAttempts) {
+                 this.log.error(`[${prepId}] Prep failed for ${target} after ${maxAttempts} launch attempts. Marking as failed.`);
+                 prepState.state = 'failed'; // Mark as failed, will be removed in next cycle's loop
+                 return;
+             }
 
-                // Step 2: Grow if necessary
-                if (currentMoney < maxMoney) {
-                    const growMultiplier = maxMoney / Math.max(1, currentMoney); // Avoid div by zero
-                    const threads = Math.max(1, Math.ceil(this.ns.growthAnalyze(target, growMultiplier)));
-                    const growTime = this.ns.getGrowTime(target);
-                    this.log.info(`[${prepId}] Grow needed (x${growMultiplier.toFixed(2)}). Launching ${threads} threads (ETA: ${(growTime / 1000).toFixed(1)}s)...`);
-                    const success = this.executePrepTask(CONFIG.GROW_WORKER, target, threads, prepId);
-                    if (!success) throw new Error(`[${prepId}] Failed launch grow`);
-                    this.log.info(`[${prepId}] Waiting for grow...`);
-                    await this.ns.sleep(growTime + spacer * 2); 
-                    continue; 
-                }
+             this.log.info(`[${prepId}] Attempt ${prepState.attempts}/${maxAttempts} to launch prep worker for ${target}...`);
+             const scriptRam = this.ramCosts.prep;
+             const assignments = this.resourceManager.findServersForThreads(scriptRam, 1);
+
+             if (assignments.length > 0) {
+                 const host = assignments[0].hostname;
+                 this.log.info(`[${prepId}] Found host ${host} for prep worker.`);
+                 
+                 // Attempt to reserve RAM first
+                 if (this.resourceManager.reserveRamBlocks(assignments, scriptRam)) {
+                     this.log.info(`[${prepId}] Reserved ${formatRam(this.ns, scriptRam)} on ${host}. Executing prep worker...`);
+                     const pid = this.ns.exec(CONFIG.PREP_WORKER, host, 1, target, prepId);
+
+                     if (pid > 0) {
+                         prepState.pid = pid;
+                         prepState.host = host; // Store host where it runs
+                         prepState.state = 'prepping';
+                         this.log.info(`[${prepId}] Prep worker launched successfully on ${host} (PID: ${pid}).`);
+                     } else {
+                         this.log.error(`[${prepId}] Failed to ns.exec prep worker on ${host}. Releasing reservation.`);
+                         this.resourceManager.releaseRamBlocks(assignments, scriptRam); // Release RAM if exec failed
+                         // Stay in 'start' state to retry next cycle
+                     }
+                 } else {
+                     this.log.warn(`[${prepId}] Failed to reserve RAM for prep worker on ${host} (state may have changed). Will retry next cycle.`);
+                     // Stay in 'start' state
+                 }
+             } else {
+                 this.log.warn(`[${prepId}] No suitable host found for prep worker (Needs ${formatRam(this.ns, scriptRam)}). Will retry next cycle.`);
+                 // Stay in 'start' state
+             }
+             return; // End cycle after launch attempt
+        }
+
+        // State: prepping - Monitor the running worker
+        if (prepState.state === 'prepping') {
+            if (!prepState.pid || !prepState.host) {
+                this.log.error(`[${prepId}] Invalid state: 'prepping' but no PID or host found! Marking failed.`);
+                prepState.state = 'failed';
+                return;
+            }
+
+            if (this.ns.isRunning(prepState.pid, prepState.host)) {
+                this.log.debug(`[${prepId}] Prep worker (PID: ${prepState.pid} on ${prepState.host}) is still running...`);
+            } else {
+                this.log.info(`[${prepId}] Prep worker (PID: ${prepState.pid} on ${prepState.host}) has finished.`);
+                // Worker finished, release the RAM it was using
+                const ramReleased = this.ramCosts.prep;
+                this.resourceManager.releaseRamBlocks([{ hostname: prepState.host, threads: 1 }], ramReleased);
+                this.log.info(`[${prepId}] Released ${formatRam(this.ns, ramReleased)} on ${prepState.host}.`);
                 
-                // If we reach here, prep is done
-                this.log.info(`[${prepId}] Prep complete for ${target}.`);
-                return; // Exit successfully
+                // Check if target is actually prepped now
+                if (this.isTargetPrepped(target)) {
+                    this.log.info(`[${prepId}] Target ${target} is confirmed prepped. Removing from queue.`);
+                    this.prepQueue.delete(target); // Success!
+                } else {
+                    this.log.error(`[${prepId}] Prep worker finished, but target ${target} is NOT prepped! Marking as failed.`);
+                    prepState.state = 'failed'; // Mark as failed
+                }
             }
-            // If loop finishes without returning, max attempts reached
-            throw new Error(`[${prepId}] Max prep attempts (${maxAttempts}) reached for ${target}.`);
-        } catch (e) {
-            this.log.error(`[${prepId}] Error during prep for ${target}: ${e.message || e}`);
-            // Rethrow or handle as needed - ensures finally block runs
-            throw e; 
-        } finally {
-            this.prepQueue.delete(target); 
-            this.log.info(`[${prepId}] Removed ${target} from prep queue.`);
+            return; // End cycle after checking running process
         }
-    }
-    
-    // Helper for launching prep tasks (Correctly placed outside prepTarget)
-    executePrepTask(script, target, threads, prepId) {
-        const ramCost = this.ns.getScriptRam(script);
-        if (ramCost <= 0) { this.log.error(`[${prepId}] Script ${script} RAM is zero!`); return false; }
         
-        let overallSuccess = true;
-        const assignments = this.resourceManager.findServersForThreads(ramCost, threads);
-        if (assignments.length === 0) {
-            this.log.warn(`[${prepId}] Could not find any servers for ${threads} threads of ${script}`);
-            // This might be okay if other parts of the batch run, but indicates RAM pressure
-            // overallSuccess = false; // Decide if this constitutes overall batch failure
-            return overallSuccess;
+        // State: failed - Should be handled by the main loop, but log if somehow called
+        if (prepState.state === 'failed') {
+             this.log.warn(`[${prepId}] managePrepCycle called for failed prep state on ${target}.`);
+             return;
         }
 
-        for (const assign of assignments) {
-            const pid = this.ns.exec(script, assign.hostname, assign.threads, target, 0, prepId);
-            if (pid <= 0) {
-                this.log.error(`[${prepId}] FAILED prep exec...`);
-                overallSuccess = false;
-            }
-        }
-
-        return overallSuccess;
+        // Should not be reached
+        this.log.error(`[${prepId}] Target ${target} in unknown prep state: ${prepState.state}`);
+        prepState.state = 'failed'; // Mark as failed if state is broken
     }
 
     // --- Batch Calculation ---
@@ -359,57 +391,93 @@ export class HackManager {
         };
     }
 
-    // --- Batch Scheduling & Execution ---
-    // Removed scheduleBatches - logic moved into manageHacking
-
-    // executeBatch now returns true on success, false on critical failure
-    executeBatch(config) {
-        const batchId = this.batchCounter++;
-        this.log.info(`Executing batch ${batchId} for ${config.target}`);
-
+    // --- Batch Execution (Needs update for reserveRamBlocks) ---
+    executeBatch(config, availableRam) { 
+        this.log.info(`Executing batch for ${config.target}. RAM per batch: ${formatRam(this.ns, config.ramPerBatch)}`);
+        
         const tasks = [
-            // Order matters for calculation, but exec is near-simultaneous
-            { name: "H", script: CONFIG.HACK_WORKER, threads: config.hackThreads, delay: config.hackDelay, ram: this.ramCosts.hack },
-            { name: "W1", script: CONFIG.WEAKEN_WORKER, threads: config.weaken1Threads, delay: config.weaken1Delay, ram: this.ramCosts.weak },
-            { name: "G", script: CONFIG.GROW_WORKER, threads: config.growThreads, delay: config.growDelay, ram: this.ramCosts.grow },
-            { name: "W2", script: CONFIG.WEAKEN_WORKER, threads: config.weaken2Threads, delay: config.weaken2Delay, ram: this.ramCosts.weak },
+            { script: CONFIG.HACK_WORKER, threads: config.hackThreads, delay: config.hackDelay, ram: this.ramCosts.hack, label: 'H' },
+            { script: CONFIG.WEAKEN_WORKER, threads: config.weaken1Threads, delay: config.weaken1Delay, ram: this.ramCosts.weak, label: 'W1' },
+            { script: CONFIG.GROW_WORKER, threads: config.growThreads, delay: config.growDelay, ram: this.ramCosts.grow, label: 'G' },
+            { script: CONFIG.WEAKEN_WORKER, threads: config.weaken2Threads, delay: config.weaken2Delay, ram: this.ramCosts.weak, label: 'W2' },
         ];
+        let allTasksLaunched = true;
+        let allReservationsMade = true;
+        const batchId = `${config.target}-${Date.now()}`; 
+        const reservations = []; // Store reservations made for potential rollback
 
-        let overallSuccess = true;
         for (const task of tasks) {
             if (task.threads <= 0) continue;
-            if (task.ram <= 0) {
-                this.log.error(`Script ${task.script} RAM is zero! Cannot execute.`);
-                overallSuccess = false;
-                continue;
-            }
-
+            const requiredRamForTask = task.threads * task.ram;
             const assignments = this.resourceManager.findServersForThreads(task.ram, task.threads);
-            if (assignments.length === 0) {
-                this.log.warn(`[B${batchId}-${task.name}] Could not find any servers for ${task.threads} threads of ${task.script}`);
-                // This might be okay if other parts of the batch run, but indicates RAM pressure
-                // overallSuccess = false; // Decide if this constitutes overall batch failure
-                continue; 
+            
+            if (assignments.length === 0 || assignments.reduce((sum, a) => sum + a.threads, 0) < task.threads) {
+                this.log.error(`Batch ${batchId} (${task.label}): Failed to find sufficient hosts for ${task.threads} threads (${formatRam(this.ns, requiredRamForTask)} RAM).`);
+                allTasksLaunched = false;
+                allReservationsMade = false; // Mark so we don't try to launch
+                break; 
             }
 
-            let executedThreads = 0;
-            for (const assign of assignments) {
-                const pid = this.ns.exec(task.script, assign.hostname, assign.threads, config.target, task.delay, batchId);
-                if (pid > 0) {
-                    this.log.debug(`[B${batchId}-${task.name}] Launched ${assign.threads}t on ${assign.hostname} (PID ${pid})`);
-                    executedThreads += assign.threads;
-                } else {
-                    this.log.error(`[B${batchId}-${task.name}] FAILED exec: ${assign.threads}t on ${assign.hostname}. Check RAM.`);
-                    // If even one exec fails, we consider the batch potentially compromised
-                    overallSuccess = false; 
+            // Try to reserve RAM for this task component
+            if (!this.resourceManager.reserveRamBlocks(assignments, task.ram)) {
+                this.log.error(`Batch ${batchId} (${task.label}): Failed to RESERVE RAM for ${task.threads} threads. Aborting batch.`);
+                allTasksLaunched = false;
+                allReservationsMade = false; // Mark so we don't try to launch
+                break;
+            }
+            reservations.push({ assignments, ram: task.ram }); 
+            this.log.info(`Batch ${batchId} (${task.label}): Reserved RAM for ${task.threads} threads.`);
+
+            this.log.info(`Batch ${batchId} (${task.label}): Assigning ${task.threads} threads across ${assignments.length} hosts.`);
+            for (const assignment of assignments) {
+                const pid = this.ns.exec(
+                    task.script,
+                    assignment.hostname,
+                    assignment.threads,
+                    config.target,
+                    task.delay, // Pass delay
+                    batchId, // Pass batch identifier
+                    Math.random() // Unique arg to allow multiple calls
+                );
+                if (pid === 0) {
+                    this.log.error(`Batch ${batchId} (${task.label}): Failed ns.exec on ${assignment.hostname} for ${assignment.threads} threads.`);
+                    allTasksLaunched = false;
+                    // Don't break inner loop, try other assignments, but batch is failed
                 }
             }
-
-             if (executedThreads < task.threads) {
-                 this.log.warn(`[B${batchId}-${task.name}] Assigned only ${executedThreads}/${task.threads} threads.`);
-                 // Not necessarily a failure, but indicates lack of resources.
-             }
+            if (!allTasksLaunched) {
+                // If any ns.exec failed for this task component, the whole batch is compromised
+                this.log.error(`Batch ${batchId} (${task.label}): ns.exec failed for one or more assignments. Aborting batch launch.`);
+                break; 
+            }
         }
-        return overallSuccess;
+
+        // --- Post-execution Handling ---
+        if (allTasksLaunched && allReservationsMade) {
+             this.log.info(`Batch ${batchId} successfully launched all components.`);
+             // RAM is reserved, scripts will release implicitly on finish (or manager could track PIDs/release later)
+             return true;
+        } else {
+             this.log.error("Batch " + batchId + " failed to launch completely (Reservation or ns.exec failed). Releasing any reservations made.");
+             // Release any RAM that *was* successfully reserved before the failure
+             for (const res of reservations) {
+                 this.resourceManager.releaseRamBlocks(res.assignments, res.ram);
+             }
+             return false;
+        }
+    }
+
+    // --- Calculate RAM needed for next prep step (Simplified) ---
+    calculatePrepRam(target) {
+        // Just return the cost of the prep worker script
+        if (this.isTargetPrepped(target)) {
+            return 0; // Already prepped, no RAM needed
+        }
+        if (this.ramCosts.prep > 0) {
+            return this.ramCosts.prep;
+        } else {
+            this.log.error(`Prep worker RAM cost is 0! Check config and script.`);
+            return null; // Indicate error
+        }
     }
 } 

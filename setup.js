@@ -44,6 +44,7 @@ export async function main(ns) {
         { repoPath: "workers/hack.js", gamePath: "workers/hack.js" },
         { repoPath: "workers/grow.js", gamePath: "workers/grow.js" },
         { repoPath: "workers/weaken.js", gamePath: "workers/weaken.js" },
+        { repoPath: "workers/prepWorker.js", gamePath: "workers/prepWorker.js" },
 
         // Add any other files/directories you created here
         // Example: { repoPath: "data/augmentations.js", gamePath: "data/augmentations.js" },

@@ -3,35 +3,73 @@
  * Manages knowledge of network servers and their RAM resources.
  */
 
-import { CONFIG } from '../config.js';
+import { CONFIG, getConfig } from '../config.js';
 import { createLogger } from '../lib/logger.js';
-import { scanServers, formatRam } from '../lib/utilities.js';
+import { scanServers, formatRam, formatNumber } from '../lib/utilities.js';
+
+// List of essential worker scripts to ensure exist on usable servers
+const WORKER_SCRIPTS = [
+    CONFIG.HACK_WORKER,
+    CONFIG.GROW_WORKER,
+    CONFIG.WEAKEN_WORKER,
+    CONFIG.PREP_WORKER,
+];
 
 export class ResourceManager {
     constructor(ns) {
         this.ns = ns;
         this.log = createLogger(ns, 'ResMan');
         this.servers = [];
+        this.reservedRam = new Map();
+        this.workerScripts = WORKER_SCRIPTS;
         this.updateServerList();
     }
 
     // Scan network and update list of usable servers (rooted, has RAM)
-    updateServerList() {
-        this.log.info('Updating server list...');
+    async updateServerList() {
+        this.log.info('Updating server list and provisioning workers...');
         const allServers = scanServers(this.ns);
-        this.servers = allServers
-            .map(hostname => {
-                if (!this.ns.hasRootAccess(hostname)) return null;
-                const maxRam = this.ns.getServerMaxRam(hostname);
-                if (maxRam <= 0) return null;
-                return {
-                    hostname,
-                    maxRam,
-                    usedRam: this.ns.getServerUsedRam(hostname),
-                    hasRoot: true,
-                };
-            })
-            .filter(s => s !== null); // Remove non-rooted or RAM-less servers
+        const usableServers = [];
+        const newlyReserved = new Map();
+
+        for (const hostname of allServers) {
+            if (!this.ns.hasRootAccess(hostname)) continue;
+            const maxRam = this.ns.getServerMaxRam(hostname);
+            if (maxRam <= 0) continue;
+
+            const serverData = {
+                hostname,
+                maxRam,
+                hasRoot: true,
+            };
+
+            let provisioned = true;
+            if (hostname !== 'home') {
+                for (const script of this.workerScripts) {
+                    if (!this.ns.fileExists(script, hostname)) {
+                        this.log.info(`Copying ${script} to ${hostname}...`);
+                        if (!(await this.ns.scp(script, hostname, "home"))) {
+                            this.log.error(`Failed to copy ${script} to ${hostname}. Marking as unusable.`);
+                            provisioned = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            if (!this.reservedRam.has(hostname)) {
+                this.reservedRam.set(hostname, 0);
+            }
+            newlyReserved.set(hostname, this.reservedRam.get(hostname));
+
+            if (provisioned) {
+                usableServers.push(serverData);
+            }
+        }
+
+        this.servers = usableServers;
+        this.reservedRam = newlyReserved;
+
         this.log.info(`Found ${this.servers.length} usable servers.`);
         this.logTotalRam();
     }
@@ -45,59 +83,59 @@ export class ResourceManager {
     getNetworkRamStats() {
         let totalMaxRam = 0;
         let totalUsedRam = 0;
-        const homeReserve = CONFIG.HOME_RESERVE_RAM || 0;
+        let totalReservedRam = 0;
+
+        const homeReserve = getConfig(this.ns, 'HOME_RESERVE_RAM');
 
         for (const server of this.servers) {
             const maxRam = server.maxRam;
-            const usedRam = this.ns.getServerUsedRam(server.hostname); // Re-check used RAM
-            server.usedRam = usedRam; // Update cached value
+            const usedRam = this.ns.getServerUsedRam(server.hostname);
+            const reservedRam = this.reservedRam.get(server.hostname) || 0;
+            
             totalMaxRam += maxRam;
             totalUsedRam += usedRam;
+            totalReservedRam += reservedRam;
+
+            const actualAvailable = maxRam - usedRam;
+            if (reservedRam > actualAvailable) {
+                this.log.warn(`Reservation mismatch on ${server.hostname}: Reserved ${formatRam(this.ns, reservedRam)}, but only ${formatRam(this.ns, actualAvailable)} available (Max ${formatRam(this.ns, maxRam)}, Used ${formatRam(this.ns, usedRam)}). Adjusting reservation down.`);
+                this.reservedRam.set(server.hostname, Math.max(0, actualAvailable));
+                totalReservedRam = Array.from(this.reservedRam.values()).reduce((a, b) => a + b, 0);
+            }
         }
 
-        // Adjust for home reservation
+        // Calculate free RAM: Max - Used - Reserved
+        const totalEffectivelyUsed = totalUsedRam + totalReservedRam;
+        let totalFreeRam = totalMaxRam - totalEffectivelyUsed;
+
         const homeServer = this.servers.find(s => s.hostname === 'home');
-        let totalFreeRam = totalMaxRam - totalUsedRam;
         if (homeServer) {
-            const homeAvailable = homeServer.maxRam - homeServer.usedRam;
-            const homeReserved = Math.min(homeAvailable, homeReserve);
-            totalFreeRam = Math.max(0, totalFreeRam - homeReserved);
+            const homeUsed = this.ns.getServerUsedRam('home');
+            const homeReserved = this.reservedRam.get('home') || 0;
+            const homeEffectivelyAvailable = homeServer.maxRam - homeUsed - homeReserved;
+            const applicableHomeReserve = Math.min(homeEffectivelyAvailable, homeReserve);
+            totalFreeRam = Math.max(0, totalFreeRam - applicableHomeReserve);
         }
         
-        return { totalMaxRam, totalUsedRam, totalFreeRam };
+        return { 
+            totalMaxRam,
+            totalUsedRam,
+            totalReservedRam,
+            totalFreeRam
+        };
     }
 
     logTotalRam() {
-        const { totalMaxRam, totalFreeRam } = this.getNetworkRamStats();
-        this.log.info(`Network RAM: ${formatRam(this.ns, totalFreeRam)} free / ${formatRam(this.ns, totalMaxRam)} total`);
+        const stats = this.getNetworkRamStats();
+        this.log.info(`Network RAM: ${formatRam(this.ns, stats.totalFreeRam)} free / ${formatRam(this.ns, stats.totalMaxRam)} total ` +
+                      `(Used: ${formatRam(this.ns, stats.totalUsedRam)}, Reserved: ${formatRam(this.ns, stats.totalReservedRam)})`);
     }
 
     // Find the best server(s) to run a script with given RAM requirement
     findBestServer(requiredRam) {
-        const homeReserve = CONFIG.HOME_RESERVE_RAM || 0;
-        let bestServer = null;
-        let maxAffordableThreads = 0;
-
-        for (const server of this.servers) {
-            let availableRam = server.maxRam - this.ns.getServerUsedRam(server.hostname);
-            if (server.hostname === 'home') {
-                availableRam = Math.max(0, availableRam - homeReserve);
-            }
-
-            if (availableRam >= requiredRam) {
-                 const threads = Math.floor(availableRam / requiredRam);
-                 // Prioritize servers that can run more threads
-                 if (threads > maxAffordableThreads) {
-                     maxAffordableThreads = threads;
-                     bestServer = server.hostname;
-                 }
-            }
-        }
-
-        if (!bestServer) {
-            this.log.warn(`No server found with enough free RAM for script needing ${formatRam(this.ns, requiredRam)}`);
-        }
-        return bestServer;
+        this.log.warn("findBestServer is deprecated. Use findServersForThreads.");
+        const assignments = this.findServersForThreads(requiredRam, 1);
+        return assignments.length > 0 ? assignments[0].hostname : null;
     }
 
     // Find multiple servers to distribute threads across
@@ -105,40 +143,97 @@ export class ResourceManager {
     findServersForThreads(scriptRam, totalThreads) {
         if (scriptRam <= 0 || totalThreads <= 0) return [];
 
-        const homeReserve = CONFIG.HOME_RESERVE_RAM || 0;
+        const homeReserve = getConfig(this.ns, 'HOME_RESERVE_RAM');
         const assignments = [];
         let threadsAssigned = 0;
 
-        // Sort servers by available RAM descending (more likely to fit large chunks)
-        const sortedServers = [...this.servers].sort((a, b) => {
-            const ramA = a.maxRam - this.ns.getServerUsedRam(a.hostname) - (a.hostname === 'home' ? homeReserve : 0);
-            const ramB = b.maxRam - this.ns.getServerUsedRam(b.hostname) - (b.hostname === 'home' ? homeReserve : 0);
-            return Math.max(0, ramB) - Math.max(0, ramA);
-        });
-
-        for (const server of sortedServers) {
-            if (threadsAssigned >= totalThreads) break;
-
-            let availableRam = server.maxRam - this.ns.getServerUsedRam(server.hostname);
-             if (server.hostname === 'home') {
-                availableRam = Math.max(0, availableRam - homeReserve);
-            }
+        const serverAvailability = this.servers.map(server => {
+            const usedRam = this.ns.getServerUsedRam(server.hostname);
+            const reservedRam = this.reservedRam.get(server.hostname) || 0;
+            let availableRam = server.maxRam - usedRam - reservedRam;
             
-            const possibleThreads = Math.floor(availableRam / scriptRam);
-            if (possibleThreads <= 0) continue;
+            if (server.hostname === 'home') {
+                const homeBuffer = Math.min(server.maxRam - usedRam - reservedRam, homeReserve);
+                availableRam = Math.max(0, availableRam - homeBuffer);
+            } else {
+                availableRam = Math.max(0, availableRam);
+            }
 
+            return { hostname: server.hostname, availableRam };
+        }).sort((a, b) => b.availableRam - a.availableRam);
+
+        for (const server of serverAvailability) {
+            if (threadsAssigned >= totalThreads) break;
+            if (server.availableRam < scriptRam) continue;
+
+            const possibleThreads = Math.floor(server.availableRam / scriptRam);
             const threadsToAssign = Math.min(possibleThreads, totalThreads - threadsAssigned);
+
             if (threadsToAssign > 0) {
                 assignments.push({ hostname: server.hostname, threads: threadsToAssign });
                 threadsAssigned += threadsToAssign;
+                server.availableRam -= threadsToAssign * scriptRam;
             }
         }
 
         if (threadsAssigned < totalThreads) {
-            this.log.warn(`Could only assign ${threadsAssigned}/${totalThreads} threads for script needing ${formatRam(this.ns, scriptRam)} each.`);
+            this.log.warn(`Could only find hosts for ${threadsAssigned}/${totalThreads} threads (Script RAM: ${formatRam(this.ns, scriptRam)}).`);
         }
 
         return assignments;
+    }
+
+    // Reserve RAM based on assignments from findServersForThreads
+    // Returns true if successful, false otherwise
+    reserveRamBlocks(assignments, scriptRam) {
+        if (!assignments || assignments.length === 0 || scriptRam <= 0) return true;
+
+        for (const assign of assignments) {
+            const hostname = assign.hostname;
+            const threads = assign.threads;
+            const ramToReserve = threads * scriptRam;
+
+            const usedRam = this.ns.getServerUsedRam(hostname);
+            const currentReservation = this.reservedRam.get(hostname) || 0;
+            const serverInfo = this.servers.find(s => s.hostname === hostname);
+            const maxRam = serverInfo ? serverInfo.maxRam : 0;
+            
+            let availableRam = maxRam - usedRam - currentReservation;
+            if (hostname === 'home') {
+                const homeReserve = getConfig(this.ns, 'HOME_RESERVE_RAM');
+                const homeBuffer = Math.min(maxRam - usedRam - currentReservation, homeReserve);
+                availableRam = Math.max(0, availableRam - homeBuffer);
+            } else {
+                availableRam = Math.max(0, availableRam);
+            }
+
+            if (availableRam < ramToReserve) {
+                this.log.error(`Failed to reserve ${formatRam(this.ns, ramToReserve)} on ${hostname}. Available: ${formatRam(this.ns, availableRam)}. Reservation cancelled.`);
+                return false;
+            }
+        }
+
+        for (const assign of assignments) {
+            const hostname = assign.hostname;
+            const ramToReserve = assign.threads * scriptRam;
+            this.reservedRam.set(hostname, (this.reservedRam.get(hostname) || 0) + ramToReserve);
+            this.log.debug(`Reserved ${formatRam(this.ns, ramToReserve)} on ${hostname}. New reservation: ${formatRam(this.ns, this.reservedRam.get(hostname))}`);
+        }
+        return true;
+    }
+
+    // Release RAM previously reserved
+    releaseRamBlocks(assignments, scriptRam) {
+        if (!assignments || assignments.length === 0 || scriptRam <= 0) return;
+
+        for (const assign of assignments) {
+            const hostname = assign.hostname;
+            const ramToRelease = assign.threads * scriptRam;
+            const currentReservation = this.reservedRam.get(hostname) || 0;
+            const newReservation = Math.max(0, currentReservation - ramToRelease);
+            this.reservedRam.set(hostname, newReservation);
+            this.log.debug(`Released ${formatRam(this.ns, ramToRelease)} on ${hostname}. New reservation: ${formatRam(this.ns, newReservation)}`);
+        }
     }
 }
 

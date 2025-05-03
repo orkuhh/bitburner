@@ -9,10 +9,12 @@ import { createLogger } from './lib/logger.js';
 import { ResourceManager } from './managers/resourceManager.js';
 import { HackManager } from './managers/hackManager.js';
 import { ServerManager } from './managers/serverManager.js';
-import { FactionManager } from './managers/factionManager.js';
-import { GangManager } from './managers/gangManager.js';
-import { CorpManager } from './managers/corpManager.js';
+// import { FactionManager } from './managers/factionManager.js';
+// import { GangManager } from './managers/gangManager.js';
+// import { CorpManager } from './managers/corpManager.js';
 // Import other managers later (ServerManager, etc.)
+
+const HACKNET_MANAGER_SCRIPT = 'managers/hacknetManager.js';
 
 /** @param {NS} ns **/
 export async function main(ns) {
@@ -28,11 +30,24 @@ export async function main(ns) {
     const resourceManager = new ResourceManager(ns);
     const hackManager = new HackManager(ns, resourceManager);
     const serverManager = new ServerManager(ns, resourceManager);
-    const factionManager = new FactionManager(ns, resourceManager);
-    const gangManager = new GangManager(ns, resourceManager);
-    const corpManager = new CorpManager(ns, resourceManager);
+    // let factionManager = new FactionManager(ns, resourceManager);
+    // let gangManager = new GangManager(ns, resourceManager);
+    // let corpManager = new CorpManager(ns, resourceManager);
     // ... etc
     log.info('Managers initialized.');
+
+    // --- Ensure Hacknet Manager is Running ---
+    if (!ns.isRunning(HACKNET_MANAGER_SCRIPT, 'home')) {
+        log.info(`Starting ${HACKNET_MANAGER_SCRIPT}...`);
+        const pid = ns.run(HACKNET_MANAGER_SCRIPT, 1); // Run with 1 thread
+        if (pid === 0) {
+            log.error(`Failed to start ${HACKNET_MANAGER_SCRIPT}. Insufficient RAM on home?`);
+        } else {
+            log.info(`Started ${HACKNET_MANAGER_SCRIPT} with PID ${pid}.`);
+        }
+    } else {
+        log.info(`${HACKNET_MANAGER_SCRIPT} is already running.`);
+    }
 
     // --- Main Scheduling Loop ---
     log.info('Starting main scheduling loop...');
@@ -43,7 +58,7 @@ export async function main(ns) {
 
         try {
             // Task: Update network resource knowledge
-            resourceManager.updateServerList();
+            await resourceManager.updateServerList();
 
             // Task: Manage Hacking Activities (now async)
             await hackManager.manageHacking(cycle);
@@ -54,15 +69,13 @@ export async function main(ns) {
             }
 
             // Task: Manage Factions
-            factionManager.manageFactions();
+            // factionManager.manageFactions();
 
             // Task: Manage Gang
-            if (ns.gang.inGang()) {
-                gangManager.manageGang();
-            }
+            // gangManager.manageGang();
 
             // Task: Manage Corporation
-            corpManager.manageCorporation();
+            // corpManager.manageCorporation();
 
             // ... Add other scheduled tasks from the roadmap ...
 
